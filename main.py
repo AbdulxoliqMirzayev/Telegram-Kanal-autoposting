@@ -12,18 +12,36 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from config import (
     ADMIN_USER_IDS,
     BOT_TOKEN,
-    CHANNEL_ID,
+    CHANNEL_IDS,
+    TELEGRAM_SOURCES,
+    WEB_SOURCES,
     TIMEZONE,
     ensure_runtime_dirs,
     validate_required_env,
 )
-from database.db import count_posts_today, init_db, topic_stats
-from scheduler import format_schedule_message, next_scheduled_post, run_post_job, setup_scheduler
+from database.db import (
+    add_telegram_source,
+    count_posts_today,
+    get_telegram_sources,
+    init_db,
+    set_today_post_override,
+    topic_stats,
+)
+from scheduler import (
+    active_post_count,
+    apply_today_schedule_override,
+    format_schedule_message,
+    next_scheduled_post,
+    run_post_job,
+    setup_scheduler,
+)
 from scrapers.telegram_scraper import session_status
 
 logging.basicConfig(
@@ -53,6 +71,8 @@ MENU_CALLBACK = "menu:main"
 TEST_MENU_CALLBACK = "menu:test"
 STATS_CALLBACK = "menu:stats"
 SCHEDULE_CALLBACK = "menu:schedule"
+POST_COUNT_CALLBACK = "menu:post_count"
+ADD_SOURCE_CALLBACK = "menu:add_source"
 BACK_CALLBACK = "menu:back"
 TEST_WEB_CALLBACK = "test:web"
 TEST_TELEGRAM_CALLBACK = "test:telegram"
@@ -71,6 +91,10 @@ def main_menu_markup() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("📊 Statistika", callback_data=STATS_CALLBACK),
+            ],
+            [
+                InlineKeyboardButton("🔢 Bugungi post soni", callback_data=POST_COUNT_CALLBACK),
+                InlineKeyboardButton("➕ Source kanal", callback_data=ADD_SOURCE_CALLBACK),
             ],
         ]
     )
@@ -96,15 +120,17 @@ def test_menu_markup() -> InlineKeyboardMarkup:
 
 def panel_message(today_count: int) -> str:
     next_time, post_type = next_scheduled_post()
+    planned_count = active_post_count()
     return (
         "🤖 <b>Telegram News Bot Panel</b>\n\n"
-        f"📌 Bugungi postlar: <b>{today_count}/8</b>\n"
+        f"📌 Bugungi postlar: <b>{today_count}/{planned_count}</b>\n"
         f"⏭ Keyingi post: <b>{next_time}</b> ({SOURCE_TYPE_LABELS.get(post_type, post_type)})\n\n"
         "Kerakli bo'limni pastdagi tugmalar orqali tanlang."
     )
 
 
-def format_stats_message(stats: dict[str, object]) -> str:
+async def format_stats_message(stats: dict[str, object]) -> str:
+    telegram_sources = await get_telegram_sources(TELEGRAM_SOURCES)
     lines = [
         "📊 <b>Post statistikasi</b>",
         "",
@@ -118,6 +144,12 @@ def format_stats_message(stats: dict[str, object]) -> str:
     lines.extend(_format_topic_counts(today_topics))
     lines.extend(["", "📚 <b>Umumiy mavzular:</b>"])
     lines.extend(_format_topic_counts(total_topics))
+    lines.extend(["", "📡 <b>Yangilik manbalari:</b>", "", "<b>Telegram kanallar:</b>"])
+    lines.extend([f"- {source}" for source in telegram_sources] or ["- Hali yo'q"])
+    lines.extend(["", "<b>Web sahifalar:</b>"])
+    lines.extend([f"- {source['type']}: {source['url']}" for source in WEB_SOURCES])
+    lines.extend(["", "<b>Post joylanadigan kanallar:</b>"])
+    lines.extend([f"- {channel}" for channel in CHANNEL_IDS] or ["- Hali sozlanmagan"])
     return "\n".join(lines)
 
 
@@ -193,6 +225,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     data = query.data or ""
 
     if data in {MENU_CALLBACK, BACK_CALLBACK}:
+        context.user_data.pop("awaiting", None)
         today_count = await count_posts_today(TIMEZONE)
         await query.edit_message_text(
             panel_message(today_count),
@@ -209,9 +242,36 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if data == STATS_CALLBACK:
+        if not is_admin(user_id):
+            await query.answer("Statistika faqat admin uchun.", show_alert=True)
+            return
         stats = await topic_stats(TIMEZONE)
         await query.edit_message_text(
-            format_stats_message(stats),
+            await format_stats_message(stats),
+            reply_markup=back_markup(),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == POST_COUNT_CALLBACK:
+        if not is_admin(user_id):
+            await query.answer("Bu bo'lim faqat admin uchun.", show_alert=True)
+            return
+        context.user_data["awaiting"] = "post_count"
+        await query.edit_message_text(
+            "🔢 <b>Bugungi post soni</b>\n\nBugun nechta post joylashni xohlaysiz? 1 dan 24 gacha son yuboring.\n\nMasalan: <code>10</code>\n\nEslatma: bu sozlama faqat bugungi kun uchun amal qiladi, ertaga default jadval qaytadi.",
+            reply_markup=back_markup(),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == ADD_SOURCE_CALLBACK:
+        if not is_admin(user_id):
+            await query.answer("Bu bo'lim faqat admin uchun.", show_alert=True)
+            return
+        context.user_data["awaiting"] = "telegram_source"
+        await query.edit_message_text(
+            "➕ <b>Telegram source kanal qo'shish</b>\n\nPublic kanal linki yoki username yuboring.\n\nMasalan:\n<code>https://t.me/example</code>\nyoki\n<code>@example</code>",
             reply_markup=back_markup(),
             parse_mode="HTML",
         )
@@ -237,16 +297,71 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"⏳ <b>Test post boshlandi</b>\n\nTanlangan manba: <b>{post_type}</b>",
             parse_mode="HTML",
         )
-        ok = await run_post_job(post_type, context.bot)
+        try:
+            ok = await run_post_job(post_type, context.bot)
+        except Exception:
+            logger.exception("Test post callback failed post_type=%s", post_type)
+            ok = False
         result_text = (
             f"✅ <b>Test post yuborildi</b>\n\nManba: <b>{post_type}</b>"
             if ok
-            else f"⚠️ <b>Test post muvaffaqiyatsiz</b>\n\nManba: <b>{post_type}</b>\nMos yangilik topilmadi yoki xatolik yuz berdi."
+            else f"⚠️ <b>Test post muvaffaqiyatsiz</b>\n\nManba: <b>{post_type}</b>\nMos yangilik topilmadi yoki xatolik yuz berdi. Batafsil log Railway/terminalda ko'rinadi."
         )
         await query.edit_message_text(
             result_text,
             reply_markup=back_markup(),
             parse_mode="HTML",
+        )
+        return
+
+    logger.warning("Unknown callback data received: %s", data)
+    await query.answer("Noma'lum amal. /menu ni qayta oching.", show_alert=True)
+
+
+async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not is_admin(user.id) or not message or not message.text:
+        return
+
+    awaiting = context.user_data.get("awaiting")
+    if awaiting == "post_count":
+        raw_count = message.text.strip()
+        try:
+            count = int(raw_count)
+            await set_today_post_override(count, TIMEZONE)
+            scheduler = context.application.bot_data.get("scheduler")
+            if scheduler:
+                await apply_today_schedule_override(scheduler, context.bot, count)
+        except ValueError as exc:
+            await message.reply_text(
+                f"⚠️ {exc}\n\nIltimos, 1 dan 24 gacha son yuboring.",
+                reply_markup=back_markup(),
+            )
+            return
+
+        context.user_data.pop("awaiting", None)
+        await message.reply_text(
+            "✅ Bugungi post soni yangilandi.\n\n" + format_schedule_message(),
+            reply_markup=main_menu_markup(),
+        )
+        return
+
+    if awaiting == "telegram_source":
+        try:
+            sources = await add_telegram_source(message.text.strip(), TELEGRAM_SOURCES)
+        except ValueError as exc:
+            await message.reply_text(
+                f"⚠️ {exc}\n\nPublic kanal linki yoki username yuboring.",
+                reply_markup=back_markup(),
+            )
+            return
+
+        context.user_data.pop("awaiting", None)
+        await message.reply_text(
+            "✅ Telegram source kanal saqlandi.\n\n"
+            f"Jami source kanallar: {len(sources)} ta",
+            reply_markup=main_menu_markup(),
         )
         return
 
@@ -260,26 +375,28 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("session", session_command))
     app.add_handler(CommandHandler("test", test_command))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^(menu:|test:)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_handler))
     return app
 
 
 async def check_channel_access(app: Application) -> None:
-    try:
-        bot_user = await app.bot.get_me()
-        member = await app.bot.get_chat_member(CHANNEL_ID, bot_user.id)
-        if member.status not in {"administrator", "creator"}:
+    bot_user = await app.bot.get_me()
+    for channel_id in CHANNEL_IDS:
+        try:
+            member = await app.bot.get_chat_member(channel_id, bot_user.id)
+            if member.status not in {"administrator", "creator"}:
+                logger.warning(
+                    "Kanal tekshiruvi: bot %s kanalida admin emas. Bu kanal skip qilinadi.",
+                    channel_id,
+                )
+                continue
+            logger.info("Kanal tekshiruvi OK: bot %s kanalida admin.", channel_id)
+        except TelegramError as exc:
             logger.warning(
-                "Kanal tekshiruvi: bot %s kanalida admin emas. Botni kanalga admin qiling va Post Messages ruxsatini bering.",
-                CHANNEL_ID,
+                "Kanal tekshiruvi xatosi channel=%s error=%s. Bu kanal skip qilinadi.",
+                channel_id,
+                exc,
             )
-            return
-        logger.info("Kanal tekshiruvi OK: bot %s kanalida admin.", CHANNEL_ID)
-    except TelegramError as exc:
-        logger.error(
-            "Kanal tekshiruvi xatosi: %s. Botni %s kanaliga admin qilib qo'shing va Post Messages ruxsatini yoqing.",
-            exc,
-            CHANNEL_ID,
-        )
 
 
 async def notify_admins_startup(app: Application) -> None:
@@ -310,6 +427,7 @@ async def main() -> None:
 
     app = build_application()
     scheduler = setup_scheduler(app.bot)
+    app.bot_data["scheduler"] = scheduler
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -321,6 +439,7 @@ async def main() -> None:
 
     await app.initialize()
     await check_channel_access(app)
+    await apply_today_schedule_override(scheduler, app.bot)
     await app.start()
     if app.updater is None:
         raise RuntimeError("Telegram polling updater is not available.")

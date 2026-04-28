@@ -50,6 +50,13 @@ USE_TELETHON=false
 ## Telegram Setup
 
 Add the bot to your Telegram channel as an admin and enable `Post Messages`.
+For multiple target channels, set:
+
+```env
+TELEGRAM_CHANNEL_IDS=@channel_one,@channel_two,@channel_three
+```
+
+If the bot is removed as admin from one channel, that channel is skipped and the bot continues posting to the remaining channels.
 
 Admin commands:
 

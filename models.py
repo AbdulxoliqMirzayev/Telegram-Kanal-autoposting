@@ -16,6 +16,7 @@ class NewsArticle:
     topic: str = ""
     topics: list[str] = field(default_factory=list)
     content_hash: str = ""
+    image_url: str = ""
 
     @property
     def source(self) -> str:

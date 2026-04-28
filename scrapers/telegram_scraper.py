@@ -21,6 +21,7 @@ from config import (
     TELETHON_SESSION_PATH,
     USE_TELETHON,
 )
+from database.db import get_telegram_sources
 from models import NewsArticle
 from processor.dedup import create_content_hash, is_duplicate
 from processor.formatter import detect_topics
@@ -62,7 +63,7 @@ async def _fetch_latest_telethon() -> NewsArticle | None:
             )
             return None
 
-        for source in TELEGRAM_SOURCES:
+        for source in await get_telegram_sources(TELEGRAM_SOURCES):
             channel = _normalize_channel(source)
             try:
                 async for message in client.iter_messages(channel, limit=20):
@@ -92,7 +93,7 @@ async def _fetch_latest_public() -> NewsArticle | None:
         follow_redirects=True,
         headers=headers,
     ) as client:
-        for source in TELEGRAM_SOURCES:
+        for source in await get_telegram_sources(TELEGRAM_SOURCES):
             channel = _normalize_channel(source)
             try:
                 articles = await _fetch_public_channel(client, channel)
@@ -132,8 +133,10 @@ async def _fetch_public_channel(
         post_url = str(message.get("data-post") or "")
         message_id = _message_id_from_data_post(post_url)
         published_at = _public_message_datetime(block)
+        image_url = _public_message_image_url(block)
         article = _message_to_article(text, channel, message_id, published_at)
         if article and not await is_duplicate(article.content_hash):
+            article.image_url = image_url
             articles.append(article)
 
     logger.info("Public Telegram channel=%s returned %s candidate(s).", channel, len(articles))
@@ -263,6 +266,11 @@ def _message_to_article(
 def _split_message(text: str) -> tuple[str, str]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     title = lines[0] if lines else text[:140]
+    weak_titles = {"just in", "breaking", "update", "latest", "news"}
+    if title.lower().strip(" :.-") in weak_titles and len(lines) > 1:
+        title = lines[1]
+    if len(title) < 18 and len(lines) > 1:
+        title = lines[1]
     if len(title) > 160:
         title = title[:160].rsplit(" ", maxsplit=1)[0]
     body = " ".join(lines[1:]) or text
@@ -307,3 +315,17 @@ def _public_message_datetime(block: BeautifulSoup) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _public_message_image_url(block: BeautifulSoup) -> str:
+    photo = block.select_one(".tgme_widget_message_photo_wrap")
+    if not photo:
+        return ""
+    style = str(photo.get("style") or "")
+    marker = "url('"
+    if marker in style:
+        return style.split(marker, maxsplit=1)[1].split("'", maxsplit=1)[0]
+    marker = 'url("'
+    if marker in style:
+        return style.split(marker, maxsplit=1)[1].split('"', maxsplit=1)[0]
+    return ""

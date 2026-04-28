@@ -30,7 +30,7 @@ cp .env.example .env
 Required variables:
 
 - `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHANNEL_ID`
+- `TELEGRAM_CHANNEL_ID` or `TELEGRAM_CHANNEL_IDS`
 - `ADMIN_USER_IDS`
 
 Source variables:

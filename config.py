@@ -75,6 +75,7 @@ TELETHON_SESSION_PATH = Path(
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+CHANNEL_IDS = _split_csv(os.getenv("TELEGRAM_CHANNEL_IDS")) or ([CHANNEL_ID] if CHANNEL_ID else [])
 TELEGRAM_API_ID = _as_int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 TELEGRAM_PHONE = os.getenv("TELEGRAM_PHONE", "").strip()
@@ -146,8 +147,8 @@ def validate_required_env() -> None:
     missing: list[str] = []
     if not BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
-    if not CHANNEL_ID:
-        missing.append("TELEGRAM_CHANNEL_ID")
+    if not CHANNEL_IDS:
+        missing.append("TELEGRAM_CHANNEL_ID or TELEGRAM_CHANNEL_IDS")
     if USE_TELETHON and not TELEGRAM_API_ID:
         missing.append("TELEGRAM_API_ID")
     if USE_TELETHON and not TELEGRAM_API_HASH:
